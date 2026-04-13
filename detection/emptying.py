@@ -82,7 +82,15 @@ class EmptyingStateMachine:
 
         if state == "normal":
             self.consecutive_emptying_count = 0
+
+            # "No detection" (is_model_detection=False) counts toward initial
+            # normal-state confirmation AND resetting emptying counters, but
+            # ending an active emptying event requires model-confirmed normal.
             if is_model_detection:
+                self.consecutive_normal_count += 1
+            else:
+                # Implicit normal (no detection) — count for initial state
+                # but not for ending an active event
                 self.consecutive_normal_count += 1
 
             if self.current_state == "emptying":

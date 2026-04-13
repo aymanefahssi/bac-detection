@@ -27,16 +27,18 @@ from detection.models import get_bin_models, get_emptying_models
 # Frame sampling
 # ---------------------------------------------------------------------------
 
-def _sample_frames(video_path: str) -> List[Dict]:
+def _sample_frames(video_path: str, interval: float, label: str = "") -> List[Dict]:
+    """Sample frames from *video_path* at *interval* seconds."""
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
-    interval_frames = max(1, int(fps * cfg.FRAME_INTERVAL))
+    interval_frames = max(1, int(fps * interval))
     indices = list(range(0, total_frames, interval_frames))
 
+    tag = f" ({label})" if label else ""
     print(f"Video: {total_frames} frames @ {fps:.1f} fps ({total_frames / fps:.1f}s)")
-    print(f"Sampling: {len(indices)} frames (every {cfg.FRAME_INTERVAL}s)")
+    print(f"Sampling{tag}: {len(indices)} frames (every {interval}s)")
 
     sampled = []
     for idx in indices:
@@ -163,7 +165,8 @@ def _run_system1(frames: List[Dict]) -> Dict:
 # System 2: Emptying Detection
 # ---------------------------------------------------------------------------
 
-def _run_system2(frames: List[Dict]) -> Dict:
+def _run_system2(video_path: str) -> Dict:
+    """Detect emptying events with dense sampling (0.5s) and low confidence."""
     print("=" * 70)
     print("SYSTEM 2: EMPTYING DETECTION")
     print("=" * 70)
@@ -173,9 +176,12 @@ def _run_system2(frames: List[Dict]) -> Dict:
     half = cfg.HALF_PRECISION
     conf = cfg.EMPTYING_CONFIDENCE
 
+    # Sample frames at denser interval than System 1
+    frames = _sample_frames(video_path, cfg.EMPTYING_FRAME_INTERVAL, "S2 emptying")
+
     sm = EmptyingStateMachine()
 
-    print(f"[S2] Processing {len(frames)} frames...")
+    print(f"[S2] Processing {len(frames)} frames (conf={conf})...")
 
     for idx, fd in enumerate(frames):
         ts = fd["timestamp"]
@@ -200,26 +206,30 @@ def _run_system2(frames: List[Dict]) -> Dict:
             sm.process_frame(state, ts, crop, bbox, num_bins=-1,
                              is_model_detection=True)
         else:
+            # No detection = nothing happening = treat as normal
             if idx < 5 or idx % 10 == 0:
-                print(f"  [S2] t={ts:.1f}s: No detection")
-            continue
+                print(f"  [S2] t={ts:.1f}s: No detection -> normal (implicit)")
+            sm.process_frame("normal", ts, crop=None, bbox=None,
+                             num_bins=-1, is_model_detection=False)
 
     # Classify fullness
     events = []
     for event in sm.completed_events:
         crops = [f["crop"] for f in event.get("frames", []) if f.get("crop")]
-        if not crops:
-            continue
 
-        votes = []
-        for crop in crops:
-            try:
-                pred = fullness_model(crop, device=device, verbose=False)[0]
-                votes.append(pred.names[pred.probs.top1])
-            except Exception:
-                votes.append("unknown")
+        if crops:
+            votes = []
+            for crop in crops:
+                try:
+                    pred = fullness_model(crop, device=device, verbose=False)[0]
+                    votes.append(pred.names[pred.probs.top1])
+                except Exception:
+                    votes.append("unknown")
+            fullness = "full" if "full" in votes else "empty"
+        else:
+            # No crop images available — still count the event
+            fullness = "unknown"
 
-        fullness = "full" if "full" in votes else "empty"
         start = event.get("start_time") or 0
         end = event.get("end_time") or start + 5
         events.append({
@@ -257,9 +267,8 @@ def run(video_path: str) -> Dict:
     print("VIDEO MODE (Batch pipeline)")
     print("=" * 70)
     print(f"Config:")
-    print(f"   Frame interval : {cfg.FRAME_INTERVAL}s")
-    print(f"   Bin confidence : {cfg.YOLO_CONFIDENCE}")
-    print(f"   Emp confidence : {cfg.EMPTYING_CONFIDENCE}")
+    print(f"   S1 frame interval : {cfg.FRAME_INTERVAL}s  (conf={cfg.YOLO_CONFIDENCE})")
+    print(f"   S2 frame interval : {cfg.EMPTYING_FRAME_INTERVAL}s  (conf={cfg.EMPTYING_CONFIDENCE})")
     print("=" * 70)
 
     # Pre-load models
@@ -268,9 +277,9 @@ def run(video_path: str) -> Dict:
     get_emptying_models()
     print("All models loaded\n")
 
-    # Sample frames
-    frames = _sample_frames(video_path)
-    if not frames:
+    # Sample frames for System 1 (System 2 samples its own)
+    s1_frames = _sample_frames(video_path, cfg.FRAME_INTERVAL, "S1 bins")
+    if not s1_frames:
         print("No frames read from video")
         return {}
 
@@ -281,8 +290,8 @@ def run(video_path: str) -> Dict:
 
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=2) as pool:
-        f1 = pool.submit(_run_system1, frames)
-        f2 = pool.submit(_run_system2, frames)
+        f1 = pool.submit(_run_system1, s1_frames)
+        f2 = pool.submit(_run_system2, video_path)
         s1 = f1.result()
         s2 = f2.result()
     parallel_time = time.time() - t0

@@ -1,0 +1,33 @@
+# ============================================================
+#  bac-detection-standalone  |  Settings
+# ============================================================
+# Edit values here. Environment variables override these.
+# ============================================================
+
+# --- Device ---
+# "0" for first GPU, "cpu" for CPU-only (auto-detected if omitted)
+# device: cpu
+# half_precision: false
+
+# --- Models ---
+model_dir: models
+
+# --- System 1: Bin Detection ---
+system1:
+  confidence: 0.40        # YOLO confidence threshold
+  frame_interval: 1.5     # seconds between sampled frames
+
+# --- System 2: Emptying Detection ---
+system2:
+  confidence: 0.15        # lower than S1 — emptying model has low recall
+  frame_interval: 0.5     # denser sampling to catch short events
+
+# --- Emptying State Machine ---
+emptying:
+  consecutive_normal_to_start: 2   # frames to confirm initial normal state
+  consecutive_normal_to_end: 3     # frames to confirm emptying ended
+  consecutive_emptying_to_start: 1 # frames to confirm emptying started
+  max_event_duration: 15.0         # seconds — force-end if exceeded
+  no_bins_timeout: 5.0             # seconds without bins — force-end
+  cooldown: 3.0                    # seconds between events
+  frames_to_capture: 3             # normal frames saved for fullness classification
