@@ -77,6 +77,20 @@ class Config:
     EMPTYING_CONFIDENCE: float = _get("EMPTYING_CONFIDENCE", "system2.confidence", 0.15)
     EMPTYING_FRAME_INTERVAL: float = _get("EMPTYING_FRAME_INTERVAL", "system2.frame_interval", 0.5)
 
+    # --- Stream Mode (cycle-based) ---
+    STREAM_FRAME_INTERVAL: float = _get(
+        "STREAM_FRAME_INTERVAL", "stream.frame_interval", 0.25)
+    STREAM_CONFIDENCE: float = _get(
+        "STREAM_CONFIDENCE", "stream.confidence", 0.40)
+    STREAM_EMPTYING_CONFIDENCE: float = _get(
+        "STREAM_EMPTYING_CONFIDENCE", "stream.emptying_confidence", 0.15)
+    STREAM_MIN_CONSECUTIVE: int = _get(
+        "STREAM_MIN_CONSECUTIVE", "stream.min_consecutive", 5)
+    STREAM_NO_DETECTION_TIMEOUT: float = _get(
+        "STREAM_NO_DETECTION_TIMEOUT", "stream.no_detection_timeout", 30.0)
+    STREAM_MIN_CYCLE_FRAMES: int = _get(
+        "STREAM_MIN_CYCLE_FRAMES", "stream.min_cycle_frames", 10)
+
     # --- Emptying State Machine ---
     CONSECUTIVE_NORMAL_FRAMES_TO_START: int = _get(
         "CONSECUTIVE_NORMAL_FRAMES_TO_START", "emptying.consecutive_normal_to_start", 2)

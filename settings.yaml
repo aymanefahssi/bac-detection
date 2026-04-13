@@ -22,12 +22,21 @@ system2:
   confidence: 0.15        # lower than S1 — emptying model has low recall
   frame_interval: 0.5     # denser sampling to catch short events
 
+# --- Stream Mode (cycle-based: IDLE → ACTIVE → END → repeat) ---
+stream:
+  frame_interval: 0.25       # seconds between frames (denser than batch)
+  confidence: 0.40            # bin detection confidence
+  emptying_confidence: 0.15   # emptying detection confidence
+  min_consecutive: 5          # consecutive bin detections to start a cycle
+  no_detection_timeout: 30.0  # seconds without bins to end a cycle
+  min_cycle_frames: 10        # minimum frames with bins for valid cycle
+
 # --- Emptying State Machine ---
 emptying:
   consecutive_normal_to_start: 2   # frames to confirm initial normal state
   consecutive_normal_to_end: 3     # frames to confirm emptying ended
   consecutive_emptying_to_start: 1 # frames to confirm emptying started
-  max_event_duration: 15.0         # seconds — force-end if exceeded
+  max_event_duration: 30.0         # seconds — force-end if exceeded
   no_bins_timeout: 5.0             # seconds without bins — force-end
   cooldown: 3.0                    # seconds between events
   frames_to_capture: 3             # normal frames saved for fullness classification
