@@ -92,7 +92,6 @@ def _run_system1(frames: List[Dict]) -> Dict:
             all_crops.append(crop)
             crop_map.append({"list_idx": idx, "box": box, "timestamp": fd["timestamp"]})
 
-        # 🛑 DEBUG LOG: Print exact bin count for EVERY 1.5s frame 🛑
         print(f"  [S1 Raw] t={fd['timestamp']:.1f}s: Saw {len(boxes)} bins")
 
     print(f"\n  [S1] Classifying {len(all_crops)} crops...")
@@ -101,10 +100,12 @@ def _run_system1(frames: List[Dict]) -> Dict:
     sz_results = []
 
     def _do_material(crops):
+        display_map = {"plastique": "plastic", "metal": "metal"}
         out = []
         for c in crops:
             pred = material_model(c, device=device, verbose=False)[0]
-            out.append(pred.names[pred.probs.top1])
+            raw_name = pred.names[pred.probs.top1]
+            out.append(display_map.get(raw_name, raw_name))
         return out
 
     def _do_size(crops):
@@ -149,8 +150,12 @@ def _run_system1(frames: List[Dict]) -> Dict:
 
     aggregated = aggregate_bin_results(frame_results, tracks)
     
-    # Expose raw frame counts so we can map bins to specific time cycles
-    aggregated["frame_counts"] = [{"timestamp": f["timestamp"], "count": len(f["detections"])} for f in frame_results]
+    # Export materials safely so the cycle engine can read them
+    aggregated["frame_counts"] = [{
+        "timestamp": f["timestamp"], 
+        "count": len(f["detections"]),
+        "materials": [d.get("material", "unknown") for d in f["detections"]]
+    } for f in frame_results]
     
     print("=" * 70)
     return aggregated
@@ -289,7 +294,7 @@ def run(video_path: str) -> Dict:
         s2 = f2.result()
     parallel_time = time.time() - t0
 
-    # --- 🧠 NEW CYCLE ANALYSIS (Bin-Driven Regroupments) 🧠 ---
+    # --- 🧠 YOUR ORIGINAL CYCLE ANALYSIS (Bin-Driven Regroupments) 🧠 ---
     frame_counts = s1.get("frame_counts", [])
     raw_events = s2["emptying_events"]
     
@@ -328,8 +333,7 @@ def run(video_path: str) -> Dict:
             bins_present = 0
             print(f"Cycle {i+1}: No active bins detected.")
         else:
-            # 🛑 THE FIX: Consecutive Physical Stability 🛑
-            # Instead of total percentage, find the longest consecutive streak for each bin count.
+            # 🛑 YOUR EXACT FIX: Consecutive Physical Stability 🛑
             streaks = {}
             current_val = None
             current_streak = 0
@@ -345,8 +349,6 @@ def run(video_path: str) -> Dict:
             if current_val is not None:
                 streaks[current_val] = max(streaks.get(current_val, 0), current_streak)
                 
-            # A state is physically real if it holds steady for at least 3 consecutive frames (4.5 seconds).
-            # (If the cycle is very short, lower the requirement to the length of the cycle)
             required_streak = min(3, len(active_counts)) 
             
             valid_counts = [count for count, max_streak in streaks.items() if max_streak >= required_streak]
@@ -359,12 +361,24 @@ def run(video_path: str) -> Dict:
                 bins_present = max(valid_counts) # Take the highest physically stable count
             else:
                 bins_present = max(active_counts) # Absolute fallback
+                
+        # 🛑 SAFELY APPEND MATERIALS (Doesn't touch bin count math) 🛑
+        cycle_p = 0
+        cycle_m = 0
+        for f in c["frames"]:
+            if f["count"] == bins_present:
+                mats = f.get("materials", [])
+                cycle_p = mats.count("plastic") + mats.count("plastique")
+                cycle_m = mats.count("metal")
+                break # Just grabs the material text from the first frame that matches your confirmed bin count
         
         final_cycles.append({
             "cycle_id": i + 1,
             "start_time": round(c["start_time"], 1),
             "end_time": round(c["end_time"], 1),
             "total_bins_present": bins_present,
+            "plastic_count": cycle_p,
+            "metal_count": cycle_m,
             "emptied_count": len(cycle_events),
             "events": cycle_events
         })
@@ -387,6 +401,8 @@ def run(video_path: str) -> Dict:
         c["cycle_id"] = i + 1
 
     global_total_bacs = sum(c["total_bins_present"] for c in final_cycles)
+    global_plastic = sum(c.get("plastic_count", 0) for c in final_cycles)
+    global_metal = sum(c.get("metal_count", 0) for c in final_cycles)
 
     # -----------------------------------------------------------------------
 
@@ -395,10 +411,10 @@ def run(video_path: str) -> Dict:
     
     result = {
         "total_bacs": global_total_bacs,  
-        "small_bacs": s1_sum["small_bacs"],
-        "large_bacs": s1_sum["large_bacs"],
-        "plastique_bacs": s1_sum["plastique_bacs"],
-        "metal_bacs": s1_sum["metal_bacs"],
+        "small_bacs": s1_sum.get("small_bacs", 0),
+        "large_bacs": s1_sum.get("large_bacs", 0),
+        "plastic_bacs": global_plastic, 
+        "metal_bacs": global_metal,
         "empty_bacs": s2_sum["empty_count"],
         "full_bacs": s2_sum["full_count"],
         "emptying_events": s2_sum["total_emptying_events"],
@@ -413,7 +429,7 @@ def run(video_path: str) -> Dict:
     print("FINAL RESULTS")
     print(f"{'=' * 70}")
     print(f"   Total bins (Global) : {result['total_bacs']}")
-    print(f"   Material            : {result['plastique_bacs']}P + {result['metal_bacs']}M")
+    print(f"   Material            : {result['plastic_bacs']}P + {result['metal_bacs']}M")
     print(f"   Size                : {result['small_bacs']}S + {result['large_bacs']}L")
     print(f"   Emptying events     : {result['emptying_events']}")
     print(f"   Fullness            : {result['empty_bacs']}E + {result['full_bacs']}F")
@@ -424,6 +440,7 @@ def run(video_path: str) -> Dict:
     for c in final_cycles:
         print(f"   Cycle {c['cycle_id']} (t={c['start_time']}s to {c['end_time']}s):")
         print(f"      Bins on street : {c['total_bins_present']}")
+        print(f"      Material       : {c.get('plastic_count', 0)}P + {c.get('metal_count', 0)}M")
         print(f"      Bins emptied   : {c['emptied_count']}")
 
     print(f"\n   Parallel time   : {parallel_time:.1f}s")
