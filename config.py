@@ -74,16 +74,14 @@ class Config:
     FRAME_INTERVAL: float = _get("FRAME_INTERVAL", "system1.frame_interval", 1.5)
 
     # --- System 2: Emptying Detection ---
-    EMPTYING_CONFIDENCE: float = _get("EMPTYING_CONFIDENCE", "system2.confidence", 0.15)
-    EMPTYING_FRAME_INTERVAL: float = _get("EMPTYING_FRAME_INTERVAL", "system2.frame_interval", 0.5)
+    EMPTYING_CONFIDENCE: float = 0.90   
+    EMPTYING_FRAME_INTERVAL: float = 0.5
 
     # --- Stream Mode (cycle-based) ---
-    STREAM_FRAME_INTERVAL: float = _get(
-        "STREAM_FRAME_INTERVAL", "stream.frame_interval", 0.25)
-    STREAM_CONFIDENCE: float = _get(
-        "STREAM_CONFIDENCE", "stream.confidence", 0.40)
-    STREAM_EMPTYING_CONFIDENCE: float = _get(
-        "STREAM_EMPTYING_CONFIDENCE", "stream.emptying_confidence", 0.15)
+    STREAM_FRAME_INTERVAL: float = 0.25
+    STREAM_CONFIDENCE: float = 0.40
+    STREAM_EMPTYING_CONFIDENCE: float = 0.40
+    
     STREAM_MIN_CONSECUTIVE: int = _get(
         "STREAM_MIN_CONSECUTIVE", "stream.min_consecutive", 5)
     STREAM_NO_DETECTION_TIMEOUT: float = _get(
@@ -92,20 +90,17 @@ class Config:
         "STREAM_MIN_CYCLE_FRAMES", "stream.min_cycle_frames", 10)
 
     # --- Emptying State Machine ---
-    CONSECUTIVE_NORMAL_FRAMES_TO_START: int = _get(
-        "CONSECUTIVE_NORMAL_FRAMES_TO_START", "emptying.consecutive_normal_to_start", 2)
-    CONSECUTIVE_NORMAL_FRAMES: int = _get(
-        "CONSECUTIVE_NORMAL_FRAMES", "emptying.consecutive_normal_to_end", 3)
-    CONSECUTIVE_EMPTYING_FRAMES: int = _get(
-        "CONSECUTIVE_EMPTYING_FRAMES", "emptying.consecutive_emptying_to_start", 1)
-    MAX_EVENT_DURATION: float = _get(
-        "MAX_EVENT_DURATION", "emptying.max_event_duration", 15.0)
-    NO_BINS_TIMEOUT: float = _get(
-        "NO_BINS_TIMEOUT", "emptying.no_bins_timeout", 5.0)
-    EMPTYING_COOLDOWN: float = _get(
-        "EMPTYING_COOLDOWN", "emptying.cooldown", 3.0)
-    EMPTYING_FRAMES_TO_CAPTURE: int = _get(
-        "EMPTYING_FRAMES_TO_CAPTURE", "emptying.frames_to_capture", 3)
+    # --- Emptying State Machine (HARDCODED TO KILL FALSE POSITIVES) ---
+    CONSECUTIVE_NORMAL_FRAMES_TO_START: int = 2
+    CONSECUTIVE_NORMAL_FRAMES: int = 3
+    
+    # 🛑 THE FIX: Must see the action for 2 frame straight (0.5 seconds) to count it!
+    CONSECUTIVE_EMPTYING_FRAMES: int = 2
+    
+    MAX_EVENT_DURATION: float = 15.0
+    NO_BINS_TIMEOUT: float = 5.0
+    EMPTYING_COOLDOWN: float = 3.0
+    EMPTYING_FRAMES_TO_CAPTURE: int = 3
 
 
 cfg = Config()

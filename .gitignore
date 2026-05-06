@@ -1,12 +1,24 @@
-# Results
-results/
+# Virtual Environments
+.venv/
+venv/
+env/
 
-# Python
+# Python Cache
 __pycache__/
-*.pyc
-*.pyo
-.env
+*.py[cod]
 
-# IDE
-.vscode/
-.idea/
+# AI Models (Do not push heavy weights to GitHub!)
+*.pt
+*.onnx
+*.engine
+weights/
+
+# Videos and Media
+*.mp4
+*.avi
+*.mov
+emptying-videos/
+
+# Results and Logs
+results/
+*.json

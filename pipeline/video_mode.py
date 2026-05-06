@@ -4,7 +4,8 @@ Video analysis pipeline -- batch detection, no cloud/infra.
 1. Sample frames at 1.5s intervals
 2. System 1 (bins) + System 2 (emptying) run in parallel
 3. Multi-method aggregation + smart decision engine
-4. Save JSON result locally
+4. Cycle Analysis (State-Driven Bin Regroupments)
+5. Save JSON result locally
 """
 
 import json
@@ -28,7 +29,6 @@ from detection.models import get_bin_models, get_emptying_models
 # ---------------------------------------------------------------------------
 
 def _sample_frames(video_path: str, interval: float, label: str = "") -> List[Dict]:
-    """Sample frames from *video_path* at *interval* seconds."""
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -74,7 +74,6 @@ def _run_system1(frames: List[Dict]) -> Dict:
     all_crops = []
     crop_map = []
 
-    # Detect bins in all frames
     for idx, fd in enumerate(frames):
         pil = Image.fromarray(cv2.cvtColor(fd["frame"], cv2.COLOR_BGR2RGB))
         results = bin_model.predict(
@@ -93,18 +92,11 @@ def _run_system1(frames: List[Dict]) -> Dict:
             all_crops.append(crop)
             crop_map.append({"list_idx": idx, "box": box, "timestamp": fd["timestamp"]})
 
-        if (idx + 1) % 5 == 0:
-            print(f"  [S1] Detected bins in {idx + 1}/{len(frames)} frames")
+        # 🛑 DEBUG LOG: Print exact bin count for EVERY 1.5s frame 🛑
+        print(f"  [S1 Raw] t={fd['timestamp']:.1f}s: Saw {len(boxes)} bins")
 
-    # Batch classify material + size in parallel
-    print(f"  [S1] Classifying {len(all_crops)} crops...")
+    print(f"\n  [S1] Classifying {len(all_crops)} crops...")
 
-    def _classify_mat(crops):
-        return [material_model(c, device=device, verbose=False)[0].names[
-            material_model(c, device=device, verbose=False)[0].probs.top1
-        ] for c in crops] if False else []  # placeholder replaced below
-
-    # Actually run classification properly
     mat_results = []
     sz_results = []
 
@@ -131,7 +123,6 @@ def _run_system1(frames: List[Dict]) -> Dict:
 
     print("  [S1] Classification complete")
 
-    # Build detections + tracking
     tracks: List[SimpleTrack] = []
     next_id = 0
 
@@ -157,6 +148,10 @@ def _run_system1(frames: List[Dict]) -> Dict:
     print(f"  [S1] Tracking: {len(tracks)} tracks")
 
     aggregated = aggregate_bin_results(frame_results, tracks)
+    
+    # Expose raw frame counts so we can map bins to specific time cycles
+    aggregated["frame_counts"] = [{"timestamp": f["timestamp"], "count": len(f["detections"])} for f in frame_results]
+    
     print("=" * 70)
     return aggregated
 
@@ -166,7 +161,6 @@ def _run_system1(frames: List[Dict]) -> Dict:
 # ---------------------------------------------------------------------------
 
 def _run_system2(video_path: str) -> Dict:
-    """Detect emptying events with dense sampling (0.5s) and low confidence."""
     print("=" * 70)
     print("SYSTEM 2: EMPTYING DETECTION")
     print("=" * 70)
@@ -176,9 +170,7 @@ def _run_system2(video_path: str) -> Dict:
     half = cfg.HALF_PRECISION
     conf = cfg.EMPTYING_CONFIDENCE
 
-    # Sample frames at denser interval than System 1
     frames = _sample_frames(video_path, cfg.EMPTYING_FRAME_INTERVAL, "S2 emptying")
-
     sm = EmptyingStateMachine()
 
     print(f"[S2] Processing {len(frames)} frames (conf={conf})...")
@@ -194,29 +186,34 @@ def _run_system2(video_path: str) -> Dict:
             boxes = results[0].boxes
             best_idx = boxes.conf.argmax().item()
             detected_class = results[0].names[int(boxes.cls[best_idx].item())]
+            
+            state = "emptying" if detected_class.lower() == "emptying" else "normal"
+
+            if state == "emptying":
+                x1, y1, x2, y2 = boxes.xyxy[best_idx].cpu().numpy()
+                w = float(x2 - x1)
+                h = float(y2 - y1)
+                h = h if h > 0 else 1.0 
+                
+                if y2 < (pil.height * 0.50):
+                    state = "normal"
+                elif w < (h * 0.95):
+                    state = "normal"
+                else:
+                    box_area = w * h
+                    screen_area = pil.width * pil.height
+                    if (box_area / screen_area) < 0.04:
+                        state = "normal"
+
             bbox = boxes.xyxy[best_idx].cpu().numpy().astype(int).tolist()
             crop = pil.crop((bbox[0], bbox[1], bbox[2], bbox[3]))
-
-            state = "normal" if detected_class == "emptying" else "emptying"
-
-            if idx < 5 or idx % 10 == 0:
-                c = boxes.conf[best_idx].item()
-                print(f"  [S2] t={ts:.1f}s: '{detected_class}' (conf={c:.2f}) -> {state}")
-
-            sm.process_frame(state, ts, crop, bbox, num_bins=-1,
-                             is_model_detection=True)
+            sm.process_frame(state, ts, crop, bbox, num_bins=-1, is_model_detection=True)
         else:
-            # No detection = nothing happening = treat as normal
-            if idx < 5 or idx % 10 == 0:
-                print(f"  [S2] t={ts:.1f}s: No detection -> normal (implicit)")
-            sm.process_frame("normal", ts, crop=None, bbox=None,
-                             num_bins=-1, is_model_detection=False)
+            sm.process_frame("normal", ts, crop=None, bbox=None, num_bins=-1, is_model_detection=False)
 
-    # Classify fullness
     events = []
     for event in sm.completed_events:
         crops = [f["crop"] for f in event.get("frames", []) if f.get("crop")]
-
         if crops:
             votes = []
             for crop in crops:
@@ -227,7 +224,6 @@ def _run_system2(video_path: str) -> Dict:
                     votes.append("unknown")
             fullness = "full" if "full" in votes else "empty"
         else:
-            # No crop images available — still count the event
             fullness = "unknown"
 
         start = event.get("start_time") or 0
@@ -271,19 +267,16 @@ def run(video_path: str) -> Dict:
     print(f"   S2 frame interval : {cfg.EMPTYING_FRAME_INTERVAL}s  (conf={cfg.EMPTYING_CONFIDENCE})")
     print("=" * 70)
 
-    # Pre-load models
     print("\nLoading models...")
     get_bin_models()
     get_emptying_models()
     print("All models loaded\n")
 
-    # Sample frames for System 1 (System 2 samples its own)
     s1_frames = _sample_frames(video_path, cfg.FRAME_INTERVAL, "S1 bins")
     if not s1_frames:
         print("No frames read from video")
         return {}
 
-    # Run System 1 + System 2 in parallel
     print("\n" + "=" * 70)
     print("RUNNING SYSTEMS 1 & 2 IN PARALLEL")
     print("=" * 70)
@@ -296,11 +289,112 @@ def run(video_path: str) -> Dict:
         s2 = f2.result()
     parallel_time = time.time() - t0
 
-    # Build final result
+    # --- 🧠 NEW CYCLE ANALYSIS (Bin-Driven Regroupments) 🧠 ---
+    frame_counts = s1.get("frame_counts", [])
+    raw_events = s2["emptying_events"]
+    
+    cycles = []
+    current_cycle = None
+    GAP_THRESHOLD = 20.0
+
+    for f in frame_counts:
+        if f["count"] > 0:
+            if current_cycle is None:
+                current_cycle = {"start_time": f["timestamp"], "end_time": f["timestamp"], "frames": [f]}
+            else:
+                if f["timestamp"] - current_cycle["end_time"] <= GAP_THRESHOLD:
+                    current_cycle["end_time"] = f["timestamp"]
+                    current_cycle["frames"].append(f)
+                else:
+                    cycles.append(current_cycle)
+                    current_cycle = {"start_time": f["timestamp"], "end_time": f["timestamp"], "frames": [f]}
+    
+    if current_cycle is not None:
+        cycles.append(current_cycle)
+
+    cycles = [c for c in cycles if len(c["frames"]) >= 2]
+
+    # 2. Map the data to the cycles
+    final_cycles = []
+    print("\n--- 🛑 CYCLE LOGIC DEBUGGER 🛑 ---")
+    
+    for i, c in enumerate(cycles):
+        cycle_events = [ev for ev in raw_events if c["start_time"] - 15.0 <= ev["start_time"] <= c["end_time"] + 15.0]
+        
+        # Get all active frames in the cycle
+        active_counts = [f["count"] for f in c["frames"] if f["count"] > 0]
+        
+        if not active_counts:
+            bins_present = 0
+            print(f"Cycle {i+1}: No active bins detected.")
+        else:
+            # 🛑 THE FIX: Consecutive Physical Stability 🛑
+            # Instead of total percentage, find the longest consecutive streak for each bin count.
+            streaks = {}
+            current_val = None
+            current_streak = 0
+            
+            for val in active_counts:
+                if val == current_val:
+                    current_streak += 1
+                else:
+                    if current_val is not None:
+                        streaks[current_val] = max(streaks.get(current_val, 0), current_streak)
+                    current_val = val
+                    current_streak = 1
+            if current_val is not None:
+                streaks[current_val] = max(streaks.get(current_val, 0), current_streak)
+                
+            # A state is physically real if it holds steady for at least 3 consecutive frames (4.5 seconds).
+            # (If the cycle is very short, lower the requirement to the length of the cycle)
+            required_streak = min(3, len(active_counts)) 
+            
+            valid_counts = [count for count, max_streak in streaks.items() if max_streak >= required_streak]
+            
+            print(f"Cycle {i+1}: Active frame array: {active_counts}")
+            print(f"Cycle {i+1}: Max consecutive streaks: {streaks}")
+            print(f"Cycle {i+1}: Valid stable counts (>= {required_streak} in a row): {valid_counts}")
+            
+            if valid_counts:
+                bins_present = max(valid_counts) # Take the highest physically stable count
+            else:
+                bins_present = max(active_counts) # Absolute fallback
+        
+        final_cycles.append({
+            "cycle_id": i + 1,
+            "start_time": round(c["start_time"], 1),
+            "end_time": round(c["end_time"], 1),
+            "total_bins_present": bins_present,
+            "emptied_count": len(cycle_events),
+            "events": cycle_events
+        })
+
+    mapped_event_ids = [ev["event_id"] for c in final_cycles for ev in c["events"]]
+    unmapped_events = [ev for ev in raw_events if ev["event_id"] not in mapped_event_ids]
+    
+    if unmapped_events:
+        final_cycles.append({
+            "cycle_id": len(final_cycles) + 1,
+            "start_time": unmapped_events[0]["start_time"],
+            "end_time": unmapped_events[-1]["end_time"],
+            "total_bins_present": len(unmapped_events), 
+            "emptied_count": len(unmapped_events),
+            "events": unmapped_events
+        })
+
+    final_cycles = sorted(final_cycles, key=lambda x: x["start_time"])
+    for i, c in enumerate(final_cycles):
+        c["cycle_id"] = i + 1
+
+    global_total_bacs = sum(c["total_bins_present"] for c in final_cycles)
+
+    # -----------------------------------------------------------------------
+
     s1_sum = s1["summary"]
     s2_sum = s2["summary"]
+    
     result = {
-        "total_bacs": s1_sum["total_bacs"],
+        "total_bacs": global_total_bacs,  
         "small_bacs": s1_sum["small_bacs"],
         "large_bacs": s1_sum["large_bacs"],
         "plastique_bacs": s1_sum["plastique_bacs"],
@@ -309,31 +403,38 @@ def run(video_path: str) -> Dict:
         "full_bacs": s2_sum["full_count"],
         "emptying_events": s2_sum["total_emptying_events"],
         "event_details": s2["emptying_events"],
+        "cycles": final_cycles,
         "aggregation": s1["aggregation_methods"],
     }
 
     total_time = time.time() - overall_start
 
-    # Print results
     print(f"\n{'=' * 70}")
     print("FINAL RESULTS")
     print(f"{'=' * 70}")
-    print(f"   Total bins      : {result['total_bacs']}")
-    print(f"   Material        : {result['plastique_bacs']}P + {result['metal_bacs']}M")
-    print(f"   Size            : {result['small_bacs']}S + {result['large_bacs']}L")
-    print(f"   Emptying events : {result['emptying_events']}")
-    print(f"   Fullness        : {result['empty_bacs']}E + {result['full_bacs']}F")
+    print(f"   Total bins (Global) : {result['total_bacs']}")
+    print(f"   Material            : {result['plastique_bacs']}P + {result['metal_bacs']}M")
+    print(f"   Size                : {result['small_bacs']}S + {result['large_bacs']}L")
+    print(f"   Emptying events     : {result['emptying_events']}")
+    print(f"   Fullness            : {result['empty_bacs']}E + {result['full_bacs']}F")
+    
+    print(f"\n   --- CYCLE BREAKDOWN (Bins per Regroupment) ---")
+    if not final_cycles:
+        print("   No bin regroupments detected.")
+    for c in final_cycles:
+        print(f"   Cycle {c['cycle_id']} (t={c['start_time']}s to {c['end_time']}s):")
+        print(f"      Bins on street : {c['total_bins_present']}")
+        print(f"      Bins emptied   : {c['emptied_count']}")
+
     print(f"\n   Parallel time   : {parallel_time:.1f}s")
     print(f"   Total time      : {total_time:.1f}s")
     print(f"{'=' * 70}")
 
-    # Save locally
     os.makedirs("results", exist_ok=True)
     out_name = os.path.splitext(os.path.basename(video_path))[0]
     out_path = os.path.join("results", f"{out_name}_result.json")
 
-    # Remove non-serializable frame data from aggregation
-    save_result = {k: v for k, v in result.items() if k != "aggregation"}
+    save_result = {k: v for k, v in result.items() if k not in ["aggregation", "frame_counts"]}
     save_result["aggregation_note"] = result["aggregation"].get("decision_note", "")
     save_result["mode"] = result["aggregation"].get("mode", {})
     save_result["tracking"] = {
