@@ -165,9 +165,13 @@ def _run_system1(frames: List[Dict]) -> Dict:
 # System 2: Emptying Detection
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# System 2: Emptying Detection
+# ---------------------------------------------------------------------------
+
 def _run_system2(video_path: str) -> Dict:
     print("=" * 70)
-    print("SYSTEM 2: EMPTYING DETECTION")
+    print("SYSTEM 2: EMPTYING DETECTION (WITH PRE-EVENT LOOKBACK)")
     print("=" * 70)
 
     emptying_model, fullness_model = get_emptying_models()
@@ -179,6 +183,11 @@ def _run_system2(video_path: str) -> Dict:
     sm = EmptyingStateMachine()
 
     print(f"[S2] Processing {len(frames)} frames (conf={conf})...")
+
+    # 🛑 THE NEW LOOKBACK BUFFER
+    rolling_crops = []
+    in_emptying = False
+    pre_event_snapshots = []
 
     for idx, fd in enumerate(frames):
         ts = fd["timestamp"]
@@ -212,27 +221,74 @@ def _run_system2(video_path: str) -> Dict:
 
             bbox = boxes.xyxy[best_idx].cpu().numpy().astype(int).tolist()
             crop = pil.crop((bbox[0], bbox[1], bbox[2], bbox[3]))
+            
+            # 🛑 FREEZE PRE-EMPTING CROPS
+            if state == "emptying":
+                if not in_emptying:
+                    # State just switched! Snapshot the recent normal bins from the past 4 seconds
+                    pre_event_snapshots.append((ts, [rc["crop"] for rc in rolling_crops]))
+                    in_emptying = True
+            else:
+                in_emptying = False
+                rolling_crops.append({"ts": ts, "crop": crop})
+                # Keep only the last 4 seconds of frames in the rolling buffer
+                rolling_crops = [rc for rc in rolling_crops if ts - rc["ts"] <= 4.0]
+
             sm.process_frame(state, ts, crop, bbox, num_bins=-1, is_model_detection=True)
         else:
+            in_emptying = False
             sm.process_frame("normal", ts, crop=None, bbox=None, num_bins=-1, is_model_detection=False)
 
     events = []
+    
+    # 🛑 DETAILED S2 LOGGER
+    print("\n" + "-" * 70)
+    print("🗑️ DETAILED EMPTYING EVENT LOG (PRE-EVENT FULLNESS) 🗑️")
+    print("-" * 70)
+
     for event in sm.completed_events:
-        crops = [f["crop"] for f in event.get("frames", []) if f.get("crop")]
-        if crops:
-            votes = []
-            for crop in crops:
+        start = event.get("start_time") or 0
+        end = event.get("end_time") or start + 5
+        
+        # Find the frozen snapshot from the past that belongs to this event
+        target_crops = []
+        for snap_ts, snap_crops in pre_event_snapshots:
+            if abs(snap_ts - start) <= 1.5:  # Match the snapshot to the event start
+                target_crops = snap_crops
+                break
+        
+        # Fallback just in case we didn't catch pre-frames (e.g. video started exactly as it tipped)
+        if not target_crops:
+            target_crops = [f["crop"] for f in event.get("frames", []) if f.get("crop")]
+
+        votes = []
+        if target_crops:
+            for crop in target_crops:
                 try:
                     pred = fullness_model(crop, device=device, verbose=False)[0]
-                    votes.append(pred.names[pred.probs.top1])
+                    raw_vote = pred.names[pred.probs.top1].lower()
+                    # Safety translation just in case your Kaggle classes were French
+                    clean_vote = "empty" if "vide" in raw_vote else raw_vote
+                    clean_vote = "full" if "plein" in raw_vote else clean_vote
+                    votes.append(clean_vote)
                 except Exception:
                     votes.append("unknown")
-            fullness = "full" if "full" in votes else "empty"
+            
+            valid_votes = [v for v in votes if v in ["full", "empty"]]
+            if valid_votes:
+                vote_counts = Counter(valid_votes)
+                fullness = vote_counts.most_common(1)[0][0]
+            else:
+                fullness = "unknown"
         else:
             fullness = "unknown"
 
-        start = event.get("start_time") or 0
-        end = event.get("end_time") or start + 5
+        print(f"  Event #{event['event_id']} (t={start:.1f}s to {end:.1f}s):")
+        print(f"     -> Pre-Emptying Frames Looked At : {len(target_crops)}")
+        print(f"     -> Raw Pre-Event AI Votes        : {votes}")
+        print(f"     -> Final Pre-Event Decision      : {fullness.upper()}")
+        print("-" * 40)
+        
         events.append({
             "event_id": event["event_id"],
             "start_time": round(start, 2),
