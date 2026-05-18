@@ -1,21 +1,25 @@
 """
-Stream mode -- process a video with cycle-based detection.
+Stream pipeline -- IDLE → ACTIVE → END → repeat.
 
-State machine:
-  IDLE   → scan frames, wait for consecutive bin detections
-  ACTIVE → per-frame detection + tracking + emptying state machine
-  END    → aggregate cycle results (batch S1 + S2), save JSON, return to IDLE
-
-Works with video files (treats them like a stream) or RTSP sources.
-Each cycle produces one result JSON in results/.
+Fixes vs supervisor's version
+-------------------------------
+1. S2 state label was INVERTED (emptying never detected). Fixed.
+2. Material labels not normalised ("plastique" → "plastic"). Fixed.
+3. Fullness voted on in-event frames instead of pre-event crops. Fixed.
+4. IDLE hot loop: wider frame interval, runs bin model only.
+5. Exact Physical Counting: Strict Streak Logic confidently handles truck occlusions.
+6. The Blindspot Fix: State Machine is now global and calibrates during IDLE to catch early events.
+7. Zero-Crop Ghost Fix: Safely rejects phantom boundary events.
+8. Current-Frame Fallback: Safely saves instant-start events from being deleted.
+9. IDLE S2 Buffer: Runs emptying model during IDLE to populate pre-event crop buffer.
+10. Minimum Crop Gate: Events with < MIN_PRE_CROPS crops are rejected entirely (no more "unknown" ghosts).
 """
 
 import json
 import os
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 from PIL import Image
@@ -30,9 +34,67 @@ from detection.models import get_bin_models, get_emptying_models
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _save_cycle_result(result: dict, session_id: str) -> str:
-    os.makedirs("results", exist_ok=True)
-    path = os.path.join("results", f"{session_id}.json")
+def _pil(frame) -> Image.Image:
+    return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+
+_MAT_MAP = {"plastique": "plastic", "metal": "metal"}
+
+
+def _vote_fullness(
+    crops: List,
+    fullness_model,
+    device: str,
+) -> Tuple[str, List[str]]:
+    """Run fullness model on a list of crops, return (winner, raw_votes)."""
+    votes = []
+    for crop in crops:
+        try:
+            pred = fullness_model(crop, device=device, verbose=False)[0]
+            raw  = pred.names[pred.probs.top1].lower()
+            v    = "empty" if "vide"  in raw else raw
+            v    = "full"  if "plein" in v   else v
+            votes.append(v)
+        except Exception:
+            votes.append("unknown")
+
+    valid = [v for v in votes if v in ("full", "empty")]
+    winner = Counter(valid).most_common(1)[0][0] if valid else "unknown"
+    return winner, votes
+
+
+def _iou(a: List[int], b: List[int]) -> float:
+    """Intersection-over-union for two [x1,y1,x2,y2] boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / (area_a + area_b - inter)
+
+
+_CACHE_IOU_THRESH = 0.50
+
+
+def _cache_lookup(
+    box: List[int],
+    cache: List[Tuple],
+) -> Optional[Tuple[str, str]]:
+    best_iou   = _CACHE_IOU_THRESH
+    best_entry = None
+    for cached_box, mat, sz in cache:
+        score = _iou(box, cached_box)
+        if score > best_iou:
+            best_iou   = score
+            best_entry = (mat, sz)
+    return best_entry
+
+
+def _save_cycle(result: Dict, source_name: str, cycle_id: int) -> str:
+    os.makedirs(os.path.join("results", "stream"), exist_ok=True)
+    path = os.path.join("results", "stream", f"{source_name}_cycle_{cycle_id}.json")
     save = {k: v for k, v in result.items() if k != "aggregation"}
     save["aggregation_note"] = result.get("aggregation", {}).get("decision_note", "")
     save["mode"] = result.get("aggregation", {}).get("mode", {})
@@ -45,360 +107,464 @@ def _save_cycle_result(result: dict, session_id: str) -> str:
     return path
 
 
-def _classify_fullness(events, fullness_model, device):
-    """Classify fullness for completed emptying events."""
-    results = []
-    for event in events:
-        crops = [f["crop"] for f in event.get("frames", []) if f.get("crop")]
-        if crops:
-            votes = []
-            for crop in crops:
-                try:
-                    pred = fullness_model(crop, device=device, verbose=False)[0]
-                    votes.append(pred.names[pred.probs.top1])
-                except Exception:
-                    votes.append("unknown")
-            fullness = "full" if "full" in votes else "empty"
-        else:
-            fullness = "unknown"
-
-        start = event.get("start_time") or 0
-        end = event.get("end_time") or start + 5
-        results.append({
-            "event_id": event["event_id"],
-            "start_time": round(start, 2),
-            "end_time": round(end, 2),
-            "duration": round(end - start, 2),
-            "fullness": fullness,
-        })
-    return results
-
-
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 def run(video_path: str) -> Dict:
-    """
-    Process *video_path* with cycle-based stream detection.
-
-    Returns a dict summarising all detected cycles.
-    """
     overall_start = time.time()
 
-    # Config
-    FRAME_INTERVAL = cfg.STREAM_FRAME_INTERVAL
-    BIN_CONF = cfg.STREAM_CONFIDENCE
-    EMP_CONF = cfg.STREAM_EMPTYING_CONFIDENCE
-    MIN_CONSECUTIVE = cfg.STREAM_MIN_CONSECUTIVE
-    NO_DET_TIMEOUT = cfg.STREAM_NO_DETECTION_TIMEOUT
-    MIN_CYCLE_FRAMES = cfg.STREAM_MIN_CYCLE_FRAMES
+    # ── Config ──────────────────────────────────────────────────────────────
+    FRAME_IV        = cfg.STREAM_FRAME_INTERVAL          # 0.25s active
+    IDLE_FRAME_IV   = FRAME_IV * 4                       # 1.0s idle (4x faster)
+    BIN_CONF        = 0.45              
+    EMP_CONF        = 0.70     
+    MIN_CONSEC      = cfg.STREAM_MIN_CONSECUTIVE         # 5
+    NO_DET_TIMEOUT  = cfg.STREAM_NO_DETECTION_TIMEOUT    # 30s
+    MIN_CYC_FRAMES  = cfg.STREAM_MIN_CYCLE_FRAMES        # 10
+    MIN_PRE_CROPS   = 2   
+    
+    MAX_EV_DUR = getattr(cfg, 'MAX_EVENT_DURATION', 15.0)
 
     print("\n" + "=" * 70)
-    print("STREAM MODE (IDLE -> ACTIVE -> END -> repeat)")
+    print("STREAM MODE  (IDLE → ACTIVE → END → repeat)")
     print("=" * 70)
-    print(f"Config:")
-    print(f"   Frame interval       : {FRAME_INTERVAL}s")
-    print(f"   Bin confidence       : {BIN_CONF}")
-    print(f"   Emptying confidence  : {EMP_CONF}")
-    print(f"   Consecutive to start : {MIN_CONSECUTIVE}")
-    print(f"   No-detection timeout : {NO_DET_TIMEOUT}s")
-    print(f"   Min frames / cycle   : {MIN_CYCLE_FRAMES}")
+    print(f"  Frame interval (active) : {FRAME_IV}s")
+    print(f"  Emptying confidence     : {EMP_CONF}")
     print("=" * 70)
 
-    # Load models
     print("\nLoading models...")
     bin_model, material_model, size_model = get_bin_models()
-    emptying_model, fullness_model = get_emptying_models()
-    print("All models loaded")
+    emptying_model, fullness_model        = get_emptying_models()
+    print("All models loaded\n")
 
     device = cfg.DEVICE
-    half = cfg.HALF_PRECISION
+    half   = cfg.HALF_PRECISION
 
-    # Open video
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    video_duration = total_frames / fps
-    frame_skip = max(1, int(fps * FRAME_INTERVAL))
+    total_frames  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps           = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    active_skip   = max(1, int(fps * FRAME_IV))
+    idle_skip     = max(1, int(fps * IDLE_FRAME_IV))
+    source_name   = os.path.splitext(os.path.basename(video_path))[0]
 
-    print(f"\nVideo: {total_frames} frames @ {fps:.1f} fps ({video_duration:.1f}s)")
-    print(f"Sampling every {frame_skip} frames ({FRAME_INTERVAL}s)")
+    all_cycles    = []
+    cycle_count   = 0
+    frame_idx     = 0
 
-    # State
-    all_cycles = []
-    cycle_count = 0
-    frame_idx = 0
+    # 🛑 GLOBAL STATE: Lives forever so it never loses calibration
+    sm                  = EmptyingStateMachine()
+    processed_event_ids = set()
+    rolling_crops       = []
+    in_emptying         = False
+    pre_event_snapshots = []
 
-    # ==================================================================
-    # Main loop
-    # ==================================================================
     while frame_idx < total_frames:
 
-        # ==============================================================
+        # =================================================================
         # IDLE — scan for bins
-        # ==============================================================
-        print(f"\n{'=' * 60}")
-        print(f"IDLE - Scanning for bins (need {MIN_CONSECUTIVE} consecutive)...")
-        print(f"   Frame {frame_idx}/{total_frames} "
-              f"({frame_idx / total_frames * 100:.1f}%)")
-        print(f"{'=' * 60}")
+        # =================================================================
+        print(f"\n{'─' * 60}")
+        print(f"  IDLE  │ scanning from t={frame_idx/fps:.1f}s")
+        print(f"{'─' * 60}")
 
         consecutive = 0
-        idle_start_idx = frame_idx
 
         while frame_idx < total_frames:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             if not ret:
-                frame_idx += frame_skip
+                frame_idx += idle_skip
                 continue
 
-            timestamp = frame_idx / fps
-            pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            ts  = frame_idx / fps
+            pil = _pil(frame)
 
-            results = bin_model.predict(
+            n = len(bin_model.predict(
                 pil, imgsz=640, conf=BIN_CONF,
-                device=device, half=half, verbose=False)
-            num_bins = len(results[0].boxes)
+                device=device, half=half, verbose=False
+            )[0].boxes)
 
-            if num_bins > 0:
+            # WARMUP PING: Feed SM during IDLE so it builds a "normal" baseline
+            sm.process_frame("normal", ts, None, None, n, False)
+
+            # 🔥 Feed the rolling crop buffer during IDLE with normal-state S2 crops
+            if n > 0:
+                s2_idle = emptying_model.predict(
+                    pil, imgsz=640, conf=EMP_CONF,
+                    device=device, half=half, verbose=False)
+                if len(s2_idle[0].boxes) > 0:
+                    s2_boxes_idle = s2_idle[0].boxes
+                    best_idle = s2_boxes_idle.conf.argmax().item()
+                    det_class_idle = s2_idle[0].names[int(s2_boxes_idle.cls[best_idle].item())]
+                    if det_class_idle.lower() != "emptying":   # only normal-state crops
+                        s2_bbox_idle = s2_boxes_idle.xyxy[best_idle].cpu().numpy().astype(int).tolist()
+                        s2_crop_idle = pil.crop((s2_bbox_idle[0], s2_bbox_idle[1],
+                                                 s2_bbox_idle[2], s2_bbox_idle[3]))
+                        rolling_crops.append({"ts": ts, "crop": s2_crop_idle})
+                        # keep only last 4 seconds
+                        rolling_crops = [r for r in rolling_crops if ts - r["ts"] <= 4.0]
+
+            if n > 0:
                 consecutive += 1
-                if consecutive >= MIN_CONSECUTIVE:
-                    print(f"Bins confirmed ({num_bins})! t={timestamp:.1f}s")
+                if consecutive >= MIN_CONSEC:
+                    print(f"  → Bins confirmed — switching to ACTIVE")
                     break
-                else:
-                    print(f"   Detection {consecutive}/{MIN_CONSECUTIVE} "
-                          f"at t={timestamp:.1f}s ({num_bins} bins)")
             else:
-                if consecutive > 0:
-                    print(f"   Reset at t={timestamp:.1f}s "
-                          f"(was {consecutive}/{MIN_CONSECUTIVE})")
                 consecutive = 0
 
-            frame_idx += frame_skip
+            frame_idx += idle_skip
 
         if frame_idx >= total_frames:
-            print("\nVideo ended during IDLE")
             break
 
-        # ==============================================================
-        # ACTIVE — track bins + detect emptying
-        # ==============================================================
-        cycle_count += 1
-        session_id = f"stream_{int(time.time())}_{cycle_count}"
-        cycle_start_frame = frame_idx
-        cycle_start_time = frame_idx / fps
-        last_detection_frame = frame_idx
+        # =================================================================
+        # ACTIVE — per-frame S1 + S2, full classification
+        # =================================================================
+        cycle_count      += 1
+        cycle_start_time  = frame_idx / fps
+        last_bin_ts       = cycle_start_time
+        session_id        = f"{int(time.time())}_{cycle_count}"
 
         print(f"\n{'=' * 60}")
-        print(f"CYCLE {cycle_count} STARTED | t={cycle_start_time:.1f}s "
-              f"| {session_id}")
+        print(f"  CYCLE {cycle_count} STARTED │ t={cycle_start_time:.1f}s")
         print(f"{'=' * 60}")
 
-        tracks: List[SimpleTrack] = []
-        next_track_id = 0
-        frame_results = []
-        frames_with_bins = 0
-        state_machine = EmptyingStateMachine()
-        status_count = 0
+        tracks          = []
+        next_id         = 0
+        frame_history   = []
+        frames_w_bins   = 0
+        cycle_events    = []
+        _classify_cache = []
 
-        # Collect raw frames for batch S2 reprocessing at cycle end
-        cycle_raw_frames = []
+        status_tick = 0
 
         while frame_idx < total_frames:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             if not ret:
-                frame_idx += frame_skip
+                frame_idx += active_skip
                 continue
 
-            timestamp = frame_idx / fps
-            elapsed = timestamp - cycle_start_time
-            pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            ts  = frame_idx / fps
+            pil = _pil(frame)
 
-            # Store raw frame for later S2 batch reprocessing
-            cycle_raw_frames.append({
-                "frame_idx": frame_idx,
-                "timestamp": timestamp,
-                "frame": frame,
-            })
-
-            # -- Bin Detection -----------------------------------------
-            bin_results = bin_model.predict(
+            # ── S1: Bin detection ─────────────────────────────────────────
+            s1    = bin_model.predict(
                 pil, imgsz=640, conf=BIN_CONF,
                 device=device, half=half, verbose=False)
-            boxes = bin_results[0].boxes.xyxy.cpu().numpy().astype(int).tolist()
-            num_bins = len(boxes)
+            boxes     = s1[0].boxes.xyxy.cpu().numpy().astype(int).tolist()
+            bin_count = len(boxes)
+            new_cache = []
 
-            frame_results.append({
+            frame_data = {
                 "frame_idx": frame_idx,
-                "timestamp": timestamp,
-                "elapsed": elapsed,
-                "bin_count": num_bins,
-                "detections": [],
-            })
+                "timestamp": ts,
+                "bin_count": bin_count,
+                "detections": []
+            }
 
-            if num_bins > 0:
-                frames_with_bins += 1
-                last_detection_frame = frame_idx
-
-            # Classify each bin
             for box in boxes:
-                x1, y1, x2, y2 = box
-                crop = pil.crop((x1, y1, x2, y2))
+                cached = _cache_lookup(box, _classify_cache)
 
-                mat_pred = material_model(crop, device=device, verbose=False)[0]
-                material = mat_pred.names[mat_pred.probs.top1]
+                if cached is None:
+                    crop = pil.crop((box[0], box[1], box[2], box[3]))
+                    mat_pred = material_model(crop, device=device, verbose=False)[0]
+                    raw_mat  = mat_pred.names[mat_pred.probs.top1]
+                    material = _MAT_MAP.get(raw_mat, raw_mat)
 
-                size_pred = size_model(crop, device=device, verbose=False)[0]
-                size_label = size_pred.names[size_pred.probs.top1]
+                    sz_pred  = size_model(crop, device=device, verbose=False)[0]
+                    size_lbl = sz_pred.names[sz_pred.probs.top1]
+                else:
+                    material, size_lbl = cached
 
-                frame_results[-1]["detections"].append({
-                    "box": box, "material": material, "size": size_label})
+                frame_data["detections"].append({"box": box, "material": material, "size": size_lbl})
+                new_cache.append((box, material, size_lbl))
 
-                # Track
                 matched = False
                 for track in tracks:
                     if track.matches(box):
-                        track.update(box, material, size_label, elapsed)
+                        track.update(box, material, size_lbl, ts)
                         matched = True
                         break
                 if not matched:
-                    tracks.append(
-                        SimpleTrack(next_track_id, box, material, size_label, elapsed))
-                    next_track_id += 1
+                    tracks.append(SimpleTrack(next_id, box, material, size_lbl, ts))
+                    next_id += 1
 
-            # -- Emptying Detection (inline, low conf) -----------------
-            emp_results = emptying_model.predict(
-                pil, imgsz=640, conf=EMP_CONF,
-                device=device, half=half, verbose=False)
+            _classify_cache = new_cache
+            frame_history.append(frame_data)
 
-            if len(emp_results[0].boxes) > 0:
-                emp_boxes = emp_results[0].boxes
-                best_idx = emp_boxes.conf.argmax().item()
-                detected_class = emp_results[0].names[
-                    int(emp_boxes.cls[best_idx].item())]
-                bbox = emp_boxes.xyxy[best_idx].cpu().numpy().astype(int).tolist()
-                crop = pil.crop((bbox[0], bbox[1], bbox[2], bbox[3]))
-                state = "normal" if detected_class == "emptying" else "emptying"
-                state_machine.process_frame(
-                    state, elapsed, crop, bbox,
-                    num_bins=num_bins, is_model_detection=True)
+            if bin_count > 0:
+                frames_w_bins += 1
+                last_bin_ts    = ts
+
+            # ── S2: Emptying detection ────────────────────────────────────
+            emptying_state = "normal"
+            s2_crop        = None
+            s2_bbox        = None
+
+            if bin_count > 0:
+                s2 = emptying_model.predict(
+                    pil, imgsz=640, conf=EMP_CONF,
+                    device=device, half=half, verbose=False)
+
+                if len(s2[0].boxes) > 0:
+                    s2_boxes  = s2[0].boxes
+                    best      = s2_boxes.conf.argmax().item()
+                    det_class = s2[0].names[int(s2_boxes.cls[best].item())]
+                    conf_val  = s2_boxes.conf[best].item()
+
+                    s2_bbox = s2_boxes.xyxy[best].cpu().numpy().astype(int).tolist()
+                    s2_crop = pil.crop((s2_bbox[0], s2_bbox[1], s2_bbox[2], s2_bbox[3]))
+
+                    if det_class.lower() == "emptying":
+                        x1, y1, x2, y2 = s2_bbox
+                        w = float(x2 - x1)
+                        h = float(y2 - y1) or 1.0
+                        
+                        print(f"  [S2 DETECT t={ts:.1f}s] conf={conf_val:.2f}", end="")
+
+                        if y2 < pil.height * 0.50:
+                            print(f" -> Rejected (Too high)")
+                        elif w < h * 0.95:
+                            print(f" -> Rejected (Too narrow)")
+                        elif (w * h) / (pil.width * pil.height) < 0.04:
+                            print(f" -> Rejected (Too small)")
+                        else:
+                            emptying_state = "emptying"
+                            print(f" -> ACCEPTED!")
+
+            if emptying_state == "emptying":
+                if not in_emptying:
+                    pre_event_snapshots.append(
+                        (ts, [rc["crop"] for rc in rolling_crops])
+                    )
+                    in_emptying = True
             else:
-                state_machine.process_frame(
-                    "normal", elapsed, crop=None, bbox=None,
-                    num_bins=num_bins, is_model_detection=False)
+                in_emptying = False
+                if s2_crop is not None:
+                    rolling_crops.append({"ts": ts, "crop": s2_crop})
+                rolling_crops = [r for r in rolling_crops if ts - r["ts"] <= 4.0]
 
-            # -- Timeout -----------------------------------------------
-            time_since_last = (frame_idx - last_detection_frame) / fps
+            sm.process_frame(
+                emptying_state, ts, s2_crop, s2_bbox,
+                num_bins=bin_count, is_model_detection=(s2_crop is not None),
+            )
 
-            status_count += 1
-            if status_count % 4 == 0:
-                print(f"   t={timestamp:.1f}s | Bins: {num_bins} "
-                      f"| Tracks: {len(tracks)} "
-                      f"| Events: {len(state_machine.completed_events)} "
-                      f"| Silent: {time_since_last:.1f}s")
+            # Harvest completed events
+            for event in sm.completed_events:
+                ev_id = event["event_id"]
+                if ev_id in processed_event_ids:
+                    continue
+                processed_event_ids.add(ev_id)
 
-            if time_since_last >= NO_DET_TIMEOUT:
-                print(f"\nNo bins for {NO_DET_TIMEOUT}s — ending cycle")
-                state_machine.force_end_if_active(elapsed)
+                start_ev = event.get("start_time") or 0
+                end_ev   = event.get("end_time")   or start_ev + 5
+
+                target_crops = []
+                for snap_ts, snap_crops in pre_event_snapshots:
+                    if abs(snap_ts - start_ev) <= 1.5:
+                        target_crops = snap_crops
+                        break
+                
+                # Active Frame Fallback
+                if not target_crops:
+                    print(f"  [S2] Event #{ev_id}: Cycle started during emptying. Using active frames instead of pre-frames.")
+                    target_crops = [f["crop"] for f in event.get("frames", []) if f.get("crop")]
+
+                # Last-resort fallback to the current frame's S2 crop
+                if not target_crops and s2_crop is not None:
+                    print(f"  [S2] Event #{ev_id}: No pre/active frames. Falling back to the current S2 crop.")
+                    target_crops = [s2_crop]
+
+                # 🛑 MINIMUM CROP GATE: reject if fewer than MIN_PRE_CROPS
+                if len(target_crops) < MIN_PRE_CROPS:
+                    print(f"\n  [S2] EVENT #{ev_id} REJECTED: only {len(target_crops)} crop(s) available (min {MIN_PRE_CROPS}).")
+                    continue
+
+                duration_ev = end_ev - start_ev
+                if event.get("force_ended") or duration_ev >= MAX_EV_DUR:
+                    print(f"\n  [S2] EVENT #{ev_id} REJECTED: Hit max duration timeout ({duration_ev:.1f}s) - Likely false positive")
+                    continue
+
+                fullness, votes = _vote_fullness(target_crops, fullness_model, device)
+                print(f"\n  [S2] EVENT #{ev_id} CONFIRMED: t={start_ev:.1f}s–{end_ev:.1f}s → {fullness.upper()} (votes: {votes})")
+
+                cycle_events.append({
+                    "event_id":   ev_id,
+                    "start_time": round(start_ev, 2),
+                    "end_time":   round(end_ev,   2),
+                    "duration":   round(duration_ev, 2),
+                    "fullness":   fullness,
+                })
+
+            # ── Timeout check ─────────────────────────────────────────────
+            gap = ts - last_bin_ts
+            status_tick += 1
+            if status_tick % 4 == 0:
+                print(f"  t={ts:.1f}s │ bins={bin_count} tracks={len(tracks)} events={len(cycle_events)} silent={gap:.1f}s")
+
+            if gap >= NO_DET_TIMEOUT:
+                print(f"\n  → No bins for {gap:.1f}s — closing cycle")
+                sm.force_end_if_active(ts)
+                
+                # Check for one last flushed event
+                for event in sm.completed_events:
+                    ev_id = event["event_id"]
+                    if ev_id in processed_event_ids: continue
+                    processed_event_ids.add(ev_id)
+                    start_ev = event.get("start_time") or 0
+                    end_ev   = event.get("end_time")   or start_ev + 5
+                    
+                    target_crops = [f["crop"] for f in event.get("frames", []) if f.get("crop")]
+                    
+                    # 🛑 MINIMUM CROP GATE in flush
+                    if len(target_crops) < MIN_PRE_CROPS:
+                        continue
+
+                    if not event.get("force_ended") and (end_ev - start_ev) < MAX_EV_DUR:
+                        fullness, votes = _vote_fullness(target_crops, fullness_model, device)
+                        print(f"\n  [S2] EVENT #{ev_id} CONFIRMED (on flush): t={start_ev:.1f}s–{end_ev:.1f}s → {fullness.upper()}")
+                        cycle_events.append({
+                            "event_id": ev_id, "start_time": round(start_ev, 2), 
+                            "end_time": round(end_ev, 2), "duration": round(end_ev - start_ev, 2), "fullness": fullness,
+                        })
                 break
 
-            frame_idx += frame_skip
+            frame_idx += active_skip
 
-        # ==============================================================
+        # =================================================================
         # END CYCLE — aggregate + save
-        # ==============================================================
-        cycle_end_time = frame_idx / fps
-        cycle_duration = cycle_end_time - cycle_start_time
+        # =================================================================
+        cycle_end_time = last_bin_ts
 
         print(f"\n{'=' * 60}")
-        print(f"CYCLE {cycle_count} COMPLETE | Duration: {cycle_duration:.1f}s")
+        print(f"  CYCLE {cycle_count} END  │ {cycle_start_time:.1f}s → {cycle_end_time:.1f}s")
         print(f"{'=' * 60}")
 
-        if frames_with_bins < MIN_CYCLE_FRAMES:
-            print(f"Invalid cycle: only {frames_with_bins} frames with bins "
-                  f"(min: {MIN_CYCLE_FRAMES}). Discarding.")
+        if frames_w_bins < MIN_CYC_FRAMES:
+            frame_idx += active_skip
             continue
 
-        # -- S1 aggregation (4-method + smart decision) ----------------
-        print(f"\n[S1] Aggregating {len(frame_results)} frames, "
-              f"{len(tracks)} tracks...")
-        s1 = aggregate_bin_results(frame_results, tracks)
-        s1_sum = s1["summary"]
+        active_frames = [f for f in frame_history if f["timestamp"] <= last_bin_ts + 2.0]
+        if not active_frames: active_frames = frame_history
 
-        # -- S2 emptying: classify fullness ----------------------------
-        emptying_events = _classify_fullness(
-            state_machine.completed_events, fullness_model, device)
+        print(f"\n[S1] Aggregating {len(active_frames)} active frames, {len(tracks)} tracks...")
+        s1 = aggregate_bin_results(active_frames, tracks)
+        s1_sum = s1.get("summary", {})
 
-        empty_n = sum(1 for e in emptying_events if e["fullness"] == "empty")
-        full_n = sum(1 for e in emptying_events if e["fullness"] == "full")
+        active_counts = [f["bin_count"] for f in active_frames if f["bin_count"] > 0]
+        if not active_counts:
+            bins_present = 0
+        else:
+            required_streak = max(3, int(1.5 / FRAME_IV)) 
+            streaks = {}
+            current_val = None
+            current_streak = 0
+            
+            for val in active_counts:
+                if val == current_val:
+                    current_streak += 1
+                else:
+                    if current_val is not None:
+                        streaks[current_val] = max(streaks.get(current_val, 0), current_streak)
+                    current_val = val
+                    current_streak = 1
+            if current_val is not None:
+                streaks[current_val] = max(streaks.get(current_val, 0), current_streak)
+                
+            valid_counts = [count for count, max_streak in streaks.items() if max_streak >= required_streak]
+            
+            if valid_counts:
+                bins_present = max(valid_counts) 
+                print(f"  [S1] Strict Streak Logic firmly asserts: {bins_present} Bins")
+            else:
+                bins_present = s1_sum.get("total_bacs", 0)
+                print(f"  [S1] No solid streak found. Falling back to S1 Mode: {bins_present} Bins")
 
-        # -- Build result ----------------------------------------------
+        cycle_plastic = 0
+        cycle_metal = 0
+        target_frames = [f for f in active_frames if f["bin_count"] == bins_present]
+        
+        if target_frames:
+            all_mats = []
+            for f in target_frames:
+                for d in f["detections"]:
+                    all_mats.append(d.get("material", "unknown"))
+            
+            num_frames = len(target_frames)
+            cycle_plastic = round((all_mats.count("plastic") + all_mats.count("plastique")) / num_frames) if num_frames > 0 else 0
+            cycle_metal = round(all_mats.count("metal") / num_frames) if num_frames > 0 else 0
+        else:
+            cycle_plastic = s1_sum.get("plastic_bacs", s1_sum.get("plastique_bacs", 0))
+            cycle_metal = s1_sum.get("metal_bacs", 0)
+
+        empty_n = sum(1 for e in cycle_events if e["fullness"] == "empty")
+        full_n  = sum(1 for e in cycle_events if e["fullness"] == "full")
+
         result = {
-            "cycle": cycle_count,
-            "session_id": session_id,
-            "total_bacs": s1_sum["total_bacs"],
-            "small_bacs": s1_sum["small_bacs"],
-            "large_bacs": s1_sum["large_bacs"],
-            "plastique_bacs": s1_sum["plastique_bacs"],
-            "metal_bacs": s1_sum["metal_bacs"],
-            "empty_bacs": empty_n,
-            "full_bacs": full_n,
-            "emptying_events": len(emptying_events),
-            "event_details": emptying_events,
-            "aggregation": s1.get("aggregation_methods", {}),
-            "start_time": round(cycle_start_time, 2),
-            "end_time": round(cycle_end_time, 2),
-            "duration": round(cycle_duration, 2),
+            "cycle_id":           cycle_count,
+            "session_id":         session_id,
+            "total_bacs":         bins_present,
+            "small_bacs":         s1_sum.get("small_bacs", 0),
+            "large_bacs":         s1_sum.get("large_bacs", 0),
+            "plastic_bacs":       cycle_plastic,
+            "metal_bacs":         cycle_metal,
+            "empty_bacs":         empty_n,
+            "full_bacs":          full_n,
+            "emptying_events":    len(cycle_events),
+            "event_details":      cycle_events,
+            "aggregation":        s1.get("aggregation_methods", {}),
+            "start_time":         round(cycle_start_time, 2),
+            "end_time":           round(cycle_end_time, 2),
+            "duration":           round(cycle_end_time - cycle_start_time, 2),
         }
 
-        # Print
         print(f"\nCYCLE {cycle_count} RESULTS:")
-        print(f"   Bins     : {s1_sum['total_bacs']} "
-              f"({s1_sum['plastique_bacs']}P + {s1_sum['metal_bacs']}M)")
-        print(f"   Size     : {s1_sum['small_bacs']}S + {s1_sum['large_bacs']}L")
-        print(f"   Emptying : {len(emptying_events)} events "
-              f"({empty_n}E + {full_n}F)")
-        print(f"   Time     : {cycle_start_time:.1f}s — {cycle_end_time:.1f}s "
-              f"({cycle_duration:.1f}s)")
+        print(f"  Bins     : {bins_present}  ({cycle_plastic}P + {cycle_metal}M)")
+        print(f"  Size     : {s1_sum.get('small_bacs', 0)}S + {s1_sum.get('large_bacs', 0)}L")
+        print(f"  Emptying : {len(cycle_events)} events  ({empty_n}E + {full_n}F)")
 
-        # Save
-        path = _save_cycle_result(result, session_id)
-        print(f"   Saved    : {path}")
+        path = _save_cycle(result, source_name, cycle_count)
+        print(f"  💾 Saved  : {path}")
 
         all_cycles.append(result)
+        frame_idx += active_skip
 
-        print(f"\n{'-' * 60}")
-        print("Returning to IDLE...")
-        print(f"{'-' * 60}")
-
-    # ==================================================================
-    # Video complete
-    # ==================================================================
+    # =========================================================================
+    # Done
+    # =========================================================================
     cap.release()
-    total_time = time.time() - overall_start
+    elapsed = time.time() - overall_start
 
-    total_bins = sum(c["total_bacs"] for c in all_cycles)
+    total_bins     = sum(c["total_bacs"] for c in all_cycles)
+    total_plastic  = sum(c["plastic_bacs"] for c in all_cycles)
+    total_metal    = sum(c["metal_bacs"] for c in all_cycles)
     total_emptying = sum(c["emptying_events"] for c in all_cycles)
+    total_empty    = sum(c["empty_bacs"] for c in all_cycles)
+    total_full     = sum(c["full_bacs"] for c in all_cycles)
 
     print(f"\n{'=' * 70}")
     print("STREAM ANALYSIS COMPLETE")
     print(f"{'=' * 70}")
-    print(f"   Total cycles        : {cycle_count}")
-    print(f"   Total bins          : {total_bins}")
-    print(f"   Total emptying      : {total_emptying}")
-    print(f"   Processing time     : {total_time:.1f}s")
-    print(f"{'=' * 70}")
+    print(f"  Cycles completed   : {len(all_cycles)}")
+    print(f"  Total bins         : {total_bins} ({total_plastic}P + {total_metal}M)")
+    print(f"  Total emptying     : {total_emptying} ({total_empty}E + {total_full}F)")
+    for c in all_cycles:
+        print(f"\n  Cycle {c['cycle_id']} (t={c['start_time']}s → {c['end_time']}s)")
+        print(f"     Bins     : {c['total_bacs']} ({c['plastic_bacs']}P + {c['metal_bacs']}M)")
+        print(f"     Size     : {c['small_bacs']}S + {c['large_bacs']}L")
+        print(f"     Emptying : {c['emptying_events']} ({c['empty_bacs']}E + {c['full_bacs']}F)")
+    print(f"\n  Wall-clock time    : {elapsed:.1f}s")
+    print(f"{'=' * 70}\n")
 
     return {
-        "total_cycles": cycle_count,
-        "total_bacs": total_bins,
+        "total_cycles":          len(all_cycles),
+        "total_bins":            total_bins,
         "total_emptying_events": total_emptying,
-        "cycles": all_cycles,
-        "processing_time": round(total_time, 2),
+        "cycles":                all_cycles,
+        "processing_time":       round(elapsed, 2),
     }
